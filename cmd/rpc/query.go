@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"slices"
@@ -62,7 +61,11 @@ func (s *Server) Height(w http.ResponseWriter, _ *http.Request, _ httprouter.Par
 func (s *Server) Account(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	// Invoke helper with the HTTP request, response writer and an inline callback
 	s.heightAndAddressParams(w, r, func(s *fsm.StateMachine, a lib.HexBytes) (interface{}, lib.ErrorI) {
-		return s.GetAccount(crypto.NewAddressFromBytes(a))
+		account, err := s.GetAccount(crypto.NewAddressFromBytes(a))
+		if err != nil {
+			return nil, err
+		}
+		return spendableAccountView(s, account), nil
 	})
 }
 
@@ -70,7 +73,11 @@ func (s *Server) Account(w http.ResponseWriter, r *http.Request, _ httprouter.Pa
 func (s *Server) Accounts(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	// Invoke helper with the HTTP request, response writer and an inline callback
 	s.heightPaginated(w, r, func(s *fsm.StateMachine, p *paginatedHeightRequest) (interface{}, lib.ErrorI) {
-		return s.GetAccountsPaginated(p.PageParams)
+		page, err := s.GetAccountsPaginated(p.PageParams)
+		if err != nil {
+			return nil, err
+		}
+		return spendableAccountPageView(s, page), nil
 	})
 }
 
@@ -103,14 +110,6 @@ func (s *Server) Validators(w http.ResponseWriter, r *http.Request, _ httprouter
 	// Invoke helper with the HTTP request, response writer and an inline callback
 	s.heightPaginated(w, r, func(s *fsm.StateMachine, p *paginatedHeightRequest) (interface{}, lib.ErrorI) {
 		return s.GetValidatorsPaginated(p.PageParams, p.ValidatorFilters)
-	})
-}
-
-// Committee returns a page of committee members ordered from the highest stake to lowest
-func (s *Server) Committee(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	// Invoke helper with the HTTP request, response writer and an inline callback
-	s.heightPaginated(w, r, func(s *fsm.StateMachine, p *paginatedHeightRequest) (interface{}, lib.ErrorI) {
-		return s.GetCommitteePaginated(p.PageParams, p.ValidatorFilters.Committee)
 	})
 }
 
@@ -269,7 +268,7 @@ func (s *Server) EcoParameters(w http.ResponseWriter, r *http.Request, _ httprou
 	})
 }
 
-// Order gets an order for the specified chain
+// Order gets an order for the specified committee
 func (s *Server) Order(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	// Invoke helper with the HTTP request, response writer and an inline callback
 	s.orderParams(w, r, func(s *fsm.StateMachine, p *orderRequest) (any, lib.ErrorI) {
@@ -277,22 +276,14 @@ func (s *Server) Order(w http.ResponseWriter, r *http.Request, _ httprouter.Para
 		if err != nil {
 			return nil, err
 		}
-		return s.GetOrder(orderId, p.ChainId)
+		return s.GetOrder(orderId, p.Committee)
 	})
 }
 
-// Orders retrieves the order book for a committee
+// Orders retrieves the order book for a committee with pagination
 func (s *Server) Orders(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	// Invoke helper with the HTTP request, response writer and an inline callback
-	s.heightAndIdParams(w, r, func(s *fsm.StateMachine, id uint64) (any, lib.ErrorI) {
-		if id == 0 {
-			return s.GetOrderBooks()
-		}
-		b, err := s.GetOrderBook(id)
-		if err != nil {
-			return nil, err
-		}
-		return &lib.OrderBooks{OrderBooks: []*lib.OrderBook{b}}, nil
+	s.ordersParams(w, r, func(s *fsm.StateMachine, req *ordersRequest) (any, lib.ErrorI) {
+		return s.GetOrdersPaginated(req.Committee, req.PageParams)
 	})
 }
 
@@ -417,8 +408,34 @@ func (s *Server) Blocks(w http.ResponseWriter, r *http.Request, _ httprouter.Par
 
 // TransactionByHash responds with a transaction with the hash h
 func (s *Server) TransactionByHash(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	// Invoke helper with the HTTP request, response writer and an inline callback
-	s.hashIndexer(w, r, func(s lib.StoreI, h lib.HexBytes) (any, lib.ErrorI) { return s.GetTxByHash(h) })
+	req := new(hashRequest)
+	if ok := unmarshal(w, r, req); !ok {
+		return
+	}
+	hashBytes, err := lib.StringToBytes(req.Hash)
+	if err != nil {
+		write(w, err, http.StatusBadRequest)
+		return
+	}
+	st, ok := s.setupStore(w)
+	if !ok {
+		return
+	}
+	defer st.Discard()
+	tx, err := st.GetTxByHash(hashBytes)
+	if err != nil {
+		write(w, err, http.StatusBadRequest)
+		return
+	}
+	if tx != nil && tx.GetTxHash() != "" {
+		write(w, tx, http.StatusOK)
+		return
+	}
+	if pendingTx, found := s.controller.GetPendingTxByHash(req.Hash); found {
+		write(w, pendingTx, http.StatusOK)
+		return
+	}
+	write(w, map[string]string{"error": "transaction not found"}, http.StatusNotFound)
 }
 
 // TransactionsByHeight response with the transactions at block height h
@@ -570,7 +587,7 @@ func (s *Server) Poll(w http.ResponseWriter, _ *http.Request, _ httprouter.Param
 
 // IndexerBlobs returns the current and previous indexer blobs as protobuf bytes
 func (s *Server) IndexerBlobs(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	req := new(heightRequest)
+	req := new(indexerBlobsRequest)
 	if ok := unmarshal(w, r, req); !ok {
 		return
 	}
@@ -598,8 +615,8 @@ func (s *Server) IndexerBlobsCached(height uint64) (*fsm.IndexerBlobs, []byte, l
 		height = currentHeight
 	}
 
-	if entry, ok := s.indexerBlobCache.get(height); ok && entry != nil && entry.blobs != nil && entry.protoBytes != nil {
-		return entry.blobs, entry.protoBytes, nil
+	if entry, ok := s.indexerBlobCache.get(height); ok && entry != nil && entry.deltaBlobs != nil && entry.deltaBytes != nil {
+		return entry.deltaBlobs, entry.deltaBytes, nil
 	}
 
 	current, err := s.controller.FSM.IndexerBlob(height)
@@ -608,7 +625,9 @@ func (s *Server) IndexerBlobsCached(height uint64) (*fsm.IndexerBlobs, []byte, l
 	}
 
 	var previous *fsm.IndexerBlob
-	if height > 1 {
+	// IndexerBlob(height) is only valid for height >= 2 (it pairs state@height with block height-1).
+	// Therefore "previous" exists only when (height-1) >= 2, i.e. height >= 3.
+	if height > 2 {
 		if cachedPrev, ok := s.indexerBlobCache.getCurrent(height - 1); ok {
 			previous = cachedPrev
 		} else {
@@ -624,24 +643,45 @@ func (s *Server) IndexerBlobsCached(height uint64) (*fsm.IndexerBlobs, []byte, l
 		Current:  current,
 		Previous: previous,
 	}
-	protoBytes, err := lib.Marshal(blobs)
+	blobDelta, err := fsm.DeltaIndexerBlobs(blobs)
 	if err != nil {
 		return nil, nil, err
 	}
-
+	deltaBytes, err := lib.Marshal(blobDelta)
+	if err != nil {
+		return nil, nil, err
+	}
 	s.indexerBlobCache.put(height, &indexerBlobCacheEntry{
 		height:     height,
-		blobs:      blobs,
-		protoBytes: protoBytes,
+		current:    current,
+		deltaBlobs: blobDelta,
+		deltaBytes: deltaBytes,
 	})
 
-	return blobs, protoBytes, nil
+	return blobDelta, deltaBytes, nil
 }
 
 // orderParams is a helper function to abstract common workflows around a callback requiring a state machine and order request
 func (s *Server) orderParams(w http.ResponseWriter, r *http.Request, callback func(s *fsm.StateMachine, request *orderRequest) (any, lib.ErrorI)) {
+	// initialize a new orderRequest object
 	req := new(orderRequest)
+	// execute the callback with the state machine and request
+	s.readOnlyStateFromHeightParams(w, r, req, func(state *fsm.StateMachine) (err lib.ErrorI) {
+		p, err := callback(state, req)
+		if err != nil {
+			write(w, err, http.StatusBadRequest)
+			return
+		}
+		write(w, p, http.StatusOK)
+		return
+	})
+}
 
+// ordersParams is a helper function to abstract common workflows around a callback requiring a state machine and orders request
+func (s *Server) ordersParams(w http.ResponseWriter, r *http.Request, callback func(s *fsm.StateMachine, request *ordersRequest) (any, lib.ErrorI)) {
+	// initialize a new ordersRequest object
+	req := new(ordersRequest)
+	// execute the callback with the state machine and request
 	s.readOnlyStateFromHeightParams(w, r, req, func(state *fsm.StateMachine) (err lib.ErrorI) {
 		p, err := callback(state, req)
 		if err != nil {
@@ -697,6 +737,45 @@ func (s *Server) heightAndAddressParams(w http.ResponseWriter, r *http.Request, 
 		write(w, p, http.StatusOK)
 		return
 	})
+}
+
+func spendableAccountView(sm *fsm.StateMachine, account *fsm.Account) *AccountView {
+	if account == nil {
+		return nil
+	}
+	total := account.Amount
+	spendable := sm.AccountSpendableAmount(account)
+	vested := sm.AccountVestedAmount(account)
+	locked := sm.AccountLockedAmount(account)
+	return &AccountView{
+		Address:            account.Address,
+		Amount:             spendable,
+		TotalAmount:        total,
+		SpendableAmount:    spendable,
+		VestedAmount:       vested,
+		LockedAmount:       locked,
+		VestingAmount:      account.VestingAmount,
+		VestingStartHeight: account.VestingStartHeight,
+		VestingCliffHeight: account.VestingCliffHeight,
+		VestingEndHeight:   account.VestingEndHeight,
+	}
+}
+
+func spendableAccountPageView(sm *fsm.StateMachine, page *lib.Page) *lib.Page {
+	if page == nil {
+		return nil
+	}
+	view := *page
+	accounts, ok := page.Results.(*fsm.AccountPage)
+	if !ok || accounts == nil {
+		return &view
+	}
+	result := make(AccountViewPage, 0, len(*accounts))
+	for _, account := range *accounts {
+		result = append(result, spendableAccountView(sm, account))
+	}
+	view.Results = &result
+	return &view
 }
 
 // heightAndIdParams is a helper function to execute a callback with a state machine and ID as parameters
@@ -942,26 +1021,6 @@ func (s *Server) withStore(fn func(st *store.Store) (any, error)) (any, error) {
 	}
 	defer st.Discard()
 	return fn(st)
-}
-
-// debugHandler is the http handler for debugging endpoints
-func debugHandler(routeName string) httprouter.Handle {
-	var f http.HandlerFunc
-	switch routeName {
-	case DebugHeapRouteName, DebugGoroutineRouteName, DebugBlockedRouteName:
-		f = func(w http.ResponseWriter, r *http.Request) {
-			pprof.Handler(routeName).ServeHTTP(w, r)
-		}
-	case DebugCPURouteName:
-		f = pprof.Profile
-	default:
-		f = func(w http.ResponseWriter, r *http.Request) {
-			http.NotFound(w, r)
-		}
-	}
-	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		f(w, r)
-	}
 }
 
 // parseUint64FromString parses a string into a uint64

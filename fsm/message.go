@@ -54,9 +54,19 @@ func (s *StateMachine) HandleMessage(msg lib.MessageI) lib.ErrorI {
 
 // HandleMessageSend() is the proper handler for a `Send` message
 func (s *StateMachine) HandleMessageSend(msg *MessageSend) lib.ErrorI {
+	// vesting sends must preflight recipient compatibility before mutating sender state
+	if msg.VestingStartHeight != 0 || msg.VestingEndHeight != 0 {
+		if err := s.ValidateAccountAddWithVesting(msg); err != nil {
+			return err
+		}
+	}
 	// subtract from sender
 	if err := s.AccountSub(crypto.NewAddressFromBytes(msg.FromAddress), msg.Amount); err != nil {
 		return err
+	}
+	// if special vesting send
+	if msg.VestingStartHeight != 0 || msg.VestingEndHeight != 0 {
+		return s.AccountAddWithVesting(msg)
 	}
 	// add to recipient
 	return s.AccountAdd(crypto.NewAddressFromBytes(msg.ToAddress), msg.Amount)
@@ -309,6 +319,12 @@ func (s *StateMachine) HandleMessageDAOTransfer(msg *MessageDAOTransfer) lib.Err
 	if err := s.ApproveProposal(msg); err != nil {
 		return ErrRejectProposal()
 	}
+	// optionally mint the transfer amount into the DAO pool before distributing the grant
+	if msg.Mint {
+		if err := s.MintToPool(lib.DAOPoolID, msg.Amount); err != nil {
+			return err
+		}
+	}
 	// remove from DAO fund
 	if err := s.PoolSub(lib.DAOPoolID, msg.Amount); err != nil {
 		return err
@@ -427,11 +443,10 @@ func (s *StateMachine) HandleMessageEditOrder(msg *MessageEditOrder) (err lib.Er
 	if msg.AmountForSale < valParams.MinimumOrderSize {
 		return ErrMinimumOrderSize()
 	}
-	// calculate the difference
-	difference, address := int(msg.AmountForSale-order.AmountForSale), crypto.NewAddress(order.SellersSendAddress)
+	address := crypto.NewAddress(order.SellersSendAddress)
 	// if adding to the order
-	if difference > 0 {
-		amountDifference := uint64(difference)
+	if msg.AmountForSale > order.AmountForSale {
+		amountDifference := msg.AmountForSale - order.AmountForSale
 		if err = s.AccountSub(address, amountDifference); err != nil {
 			return
 		}
@@ -440,8 +455,8 @@ func (s *StateMachine) HandleMessageEditOrder(msg *MessageEditOrder) (err lib.Er
 			return
 		}
 		// if subtracting from the order
-	} else if difference < 0 {
-		amountDifference := uint64(difference * -1)
+	} else if msg.AmountForSale < order.AmountForSale {
+		amountDifference := order.AmountForSale - msg.AmountForSale
 		// subtract from the committee escrow pool
 		if err = s.PoolSub(msg.ChainId+uint64(EscrowPoolAddend), amountDifference); err != nil {
 			return

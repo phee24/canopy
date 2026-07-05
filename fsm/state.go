@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"runtime/debug"
 	"strings"
@@ -39,9 +40,10 @@ type StateMachine struct {
 
 // cache is the set of items to be cached used by the state machine
 type cache struct {
-	accounts  map[uint64]*Account // cache of accounts accessed
-	feeParams *FeeParams          // fee params for the current block
-	valParams *ValidatorParams    // validator params for the current block
+	accounts     map[uint64]*Account // cache of accounts accessed
+	feeParams    *FeeParams          // fee params for the current block
+	valParams    *ValidatorParams    // validator params for the current block
+	rootDexBatch *lib.DexBatch       // root dex batch
 }
 
 // New() creates a new instance of a StateMachine
@@ -213,15 +215,32 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
 	}
 	// keep a map to track transactions that failed 'check'
 	failedCheckTxs := map[int]error{}
+	// map signature batch indices back to original tx indices
+	batchToTxIdx := make([]int, 0, len(txs))
 	// first batch validate signatures over the entire set
 	for i, tx := range txs {
+		preCount := batchVerifier.Count()
+		checkStore := s.Store().(lib.StoreI)
+		checkTxn, e := s.TxnWrap()
+		if e != nil {
+			return e
+		}
 		if _, checkErr := s.CheckTx(tx, "", batchVerifier); checkErr != nil {
 			failedCheckTxs[i] = checkErr
+		}
+		checkTxn.Discard()
+		s.SetStore(checkStore)
+		postCount := batchVerifier.Count()
+		for j := preCount; j < postCount; j++ {
+			batchToTxIdx = append(batchToTxIdx, i)
 		}
 	}
 	// execute batch verification of the signatures in the block
 	for _, failedIdx := range batchVerifier.Verify() {
-		failedCheckTxs[failedIdx] = ErrInvalidSignature()
+		if failedIdx < 0 || failedIdx >= len(batchToTxIdx) {
+			return ErrInvalidSignature()
+		}
+		failedCheckTxs[batchToTxIdx[failedIdx]] = ErrInvalidSignature()
 	}
 	// set the store back to the original at the end of processing
 	originalStore := s.Store().(lib.StoreI)
@@ -428,6 +447,10 @@ func (s *StateMachine) GetMaxBlockSize() (uint64, lib.ErrorI) {
 	if err != nil {
 		return 0, err
 	}
+	// fail closed on malformed persisted config to avoid uint64 underflow.
+	if consParams.BlockSize < lib.MaxBlockHeaderSize {
+		return 0, ErrInvalidParam(ParamBlockSize)
+	}
 	// return the max block size
 	return consParams.BlockSize - lib.MaxBlockHeaderSize, nil
 }
@@ -452,10 +475,6 @@ func (s *StateMachine) LoadRootChainInfo(id, height uint64) (*lib.RootChainInfo,
 		return nil, err
 	}
 	defer sm.Discard()
-	// if height is equal to latest height, provide the validator cache to the FSM
-	if height == s.height {
-		sm.cache = s.cache
-	}
 	// get the previous state machine height
 	lastSM, err := s.TimeMachine(lastHeight)
 	if err != nil {
@@ -520,7 +539,8 @@ func (s *StateMachine) Copy() (*StateMachine, lib.ErrorI) {
 		Plugin:             s.Plugin,
 		log:                s.log,
 		cache: &cache{
-			accounts: make(map[uint64]*Account),
+			accounts:     make(map[uint64]*Account),
+			rootDexBatch: s.cache.rootDexBatch,
 		},
 		LastValidatorSet: s.LastValidatorSet,
 	}, nil
@@ -614,12 +634,8 @@ func (s *StateMachine) TxnWrap() (lib.StoreI, lib.ErrorI) {
 	return txn, nil
 }
 
-// catchPanic() acts as a failsafe, recovering from a panic and logging the error with the stack trace
-func (s *StateMachine) catchPanic() {
-	if r := recover(); r != nil {
-		s.log.Error(string(debug.Stack()))
-	}
-}
+// SetRooDexCache sets the root dex batch cache for the state machine
+func (s *StateMachine) SetRootDexCache(batch *lib.DexBatch) { s.cache.rootDexBatch = batch }
 
 // Reset() resets the state store and the slash tracker
 func (s *StateMachine) Reset() {
@@ -634,6 +650,11 @@ func (s *StateMachine) Reset() {
 // ResetCaches() dumps the state machine caches
 func (s *StateMachine) ResetCaches() {
 	s.cache.accounts = make(map[uint64]*Account)
+	// Params caches must not outlive the current store view, otherwise Reset()/rollback
+	// can leave the FSM reading stale values that disagree with the underlying store.
+	s.cache.valParams = nil
+	s.cache.feeParams = nil
+	s.cache.rootDexBatch = nil
 }
 
 // nonEmptyHash() ensures the hash isn't empty
@@ -710,6 +731,16 @@ func (s *StateMachine) StateRead(request *lib.PluginStateReadRequest) (response 
 
 // StateWrite() implements the 'state write' interface for plugins
 func (s *StateMachine) StateWrite(request *lib.PluginStateWriteRequest) (response lib.PluginStateWriteResponse, err lib.ErrorI) {
+	// GUARD: validate the ENTIRE batch BEFORE applying any operation, so a misconfigured plugin can
+	// never (even partially) persist records that collide with reserved core state prefixes. This
+	// panics loudly rather than silently corrupting consensus state (e.g. writing a custom record
+	// under the validators prefix, which would later be mis-decoded as a Validator).
+	for _, setRequest := range request.Sets {
+		assertPluginKeyWritable(setRequest.Key)
+	}
+	for _, delRequest := range request.Deletes {
+		assertPluginKeyWritable(delRequest.Key)
+	}
 	// for each 'set' request
 	for _, setRequest := range request.Sets {
 		// execute the 'set'
@@ -725,4 +756,63 @@ func (s *StateMachine) StateWrite(request *lib.PluginStateWriteRequest) (respons
 		}
 	}
 	return
+}
+
+// pluginWritableCorePrefixes are the only core-owned store prefixes a plugin is permitted to write.
+// Plugins share the FSM keyspace, so they may interoperate with accounts and pools (e.g. a custom
+// 'send' that moves real balances), but writing under any OTHER core prefix would corrupt consensus
+// state and collide with plugin records on range reads.
+var pluginWritableCorePrefixes = map[byte]struct{}{
+	accountPrefix[0]: {},
+	poolPrefix[0]:    {},
+}
+
+// corePrefixNames maps every reserved single-byte core store prefix to a human-readable name.
+var corePrefixNames = map[byte]string{
+	accountPrefix[0]:          "accounts",
+	poolPrefix[0]:             "pools",
+	validatorPrefix[0]:        "validators",
+	committeePrefix[0]:        "committees",
+	unstakePrefix[0]:          "unstaking",
+	pausedPrefix[0]:           "paused",
+	paramsPrefix[0]:           "params",
+	nonSignerPrefix[0]:        "non-signers",
+	lastProposersPrefix[0]:    "last-proposers",
+	supplyPrefix[0]:           "supply",
+	delegatePrefix[0]:         "delegations",
+	committeesDataPrefix[0]:   "committees-data",
+	orderBookPrefix[0]:        "order-book",
+	retiredCommitteePrefix[0]: "retired-committees",
+	dexPrefix[0]:              "dex",
+}
+
+// assertPluginKeyWritable panics if a plugin write targets a reserved core prefix it must not touch.
+// Plugins choose their own key prefixes in plugin code (nothing is declared to core up front), so a
+// state write is the earliest point at which core can deterministically detect a colliding prefix.
+// Panicking here guarantees a misconfigured plugin can NEVER silently persist records that collide
+// with core state (the bug class where, e.g., custom records written under prefix 3 are later read
+// back as core validators). Plugin-owned records must use prefixes OUTSIDE the core-reserved range.
+func assertPluginKeyWritable(key []byte) {
+	// decode the leading length-prefixed segment; core store prefixes are a single byte
+	segments, err := decodeLengthPrefixedSafe(key)
+	if err != nil || len(segments) == 0 || len(segments[0]) != 1 {
+		// not a recognizable single-byte-prefixed core key; nothing to enforce
+		return
+	}
+	prefix := segments[0][0]
+	// only reserved core prefixes are enforced; plugin-owned prefixes (outside 1-15) are always fine
+	name, isCore := corePrefixNames[prefix]
+	if !isCore {
+		return
+	}
+	// accounts/pools are explicitly shared with plugins for interoperability
+	if _, allowed := pluginWritableCorePrefixes[prefix]; allowed {
+		return
+	}
+	panic(fmt.Sprintf(
+		"plugin attempted to write to reserved core state prefix %d (%s); plugins share the FSM "+
+			"keyspace and may only write to accounts/pools or use key prefixes OUTSIDE the "+
+			"core-reserved range (1-15) for their own records — see plugin TUTORIAL.md "+
+			"'avoid prefix collisions'", prefix, name,
+	))
 }

@@ -1,14 +1,49 @@
 #!/bin/bash
 # pluginctl.sh - Control script for managing the kotlin-plugin
-# Usage: ./pluginctl.sh {start|stop|status|restart|build}
+# Usage: ./pluginctl.sh {start|stop|status|restart}
 # Configuration variables for paths and files
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JAR_PATH="$SCRIPT_DIR/build/libs/canopy-plugin-kotlin-1.0.0-all.jar"
+TARBALL="$SCRIPT_DIR/kotlin-plugin.tar.gz"
 PID_FILE="/tmp/plugin/kotlin-plugin.pid"
 LOG_FILE="/tmp/plugin/kotlin-plugin.log"
 PLUGIN_DIR="/tmp/plugin"
 # Timeout in seconds for graceful shutdown
 STOP_TIMEOUT=10
+
+# Extract tarball if JAR doesn't exist
+extract_if_needed() {
+    # If JAR already exists, nothing to do
+    if [ -f "$JAR_PATH" ]; then
+        return 0
+    fi
+    
+    # Check for tarball
+    if [ -f "$TARBALL" ]; then
+        echo "Extracting $TARBALL..."
+        mkdir -p "$SCRIPT_DIR/build/libs"
+        tar -xzf "$TARBALL" -C "$SCRIPT_DIR/build/libs"
+        # Rename if needed (tarball contains kotlin-plugin.jar)
+        if [ -f "$SCRIPT_DIR/build/libs/kotlin-plugin.jar" ] && [ ! -f "$JAR_PATH" ]; then
+            mv "$SCRIPT_DIR/build/libs/kotlin-plugin.jar" "$JAR_PATH"
+        fi
+        if [ $? -eq 0 ] && [ -f "$JAR_PATH" ]; then
+            echo "Extraction complete"
+            return 0
+        else
+            echo "Error: Failed to extract JAR from $TARBALL"
+            return 1
+        fi
+    fi
+    
+    return 1
+}
+
+get_process_cmd() {
+    local pid="$1"
+    ps -p "$pid" -o args= 2>/dev/null || ps -p "$pid" -o command= 2>/dev/null
+}
+
 # Check if the process is running based on PID file
 is_running() {
     # Return 1 if PID file doesn't exist
@@ -24,7 +59,7 @@ is_running() {
     # Check if process exists and is the kotlin-plugin
     if ps -p "$pid" > /dev/null 2>&1; then
         # Verify it's actually our process
-        if ps -p "$pid" -o cmd= | grep -q "canopy-plugin-kotlin"; then
+        if get_process_cmd "$pid" | grep -q "canopy-plugin-kotlin"; then
             return 0
         fi
     fi
@@ -38,19 +73,6 @@ cleanup_pid() {
         rm -f "$PID_FILE"
     fi
 }
-# Build the kotlin-plugin fat JAR
-build() {
-    echo "Building kotlin-plugin..."
-    cd "$SCRIPT_DIR"
-    ./gradlew fatJar --no-daemon
-    if [ $? -eq 0 ]; then
-        echo "Build successful"
-        return 0
-    else
-        echo "Build failed"
-        return 1
-    fi
-}
 # Start the kotlin-plugin
 start() {
     # Check if already running
@@ -60,14 +82,13 @@ start() {
     fi
     # Clean up any stale PID file
     cleanup_pid
+    # Try to extract from tarball if JAR doesn't exist
+    extract_if_needed
     # Check if JAR exists
     if [ ! -f "$JAR_PATH" ]; then
-        echo "JAR not found at $JAR_PATH, building..."
-        build
-        if [ $? -ne 0 ]; then
-            echo "Error: Build failed"
-            return 1
-        fi
+        echo "Error: JAR not found at $JAR_PATH"
+        echo "Run 'make build' or download kotlin-plugin.tar.gz"
+        return 1
     fi
     # Ensure plugin directory exists
     mkdir -p "$PLUGIN_DIR"
@@ -166,11 +187,8 @@ case "${1:-}" in
     restart)
         restart
         ;;
-    build)
-        build
-        ;;
     *)
-        echo "Usage: $0 {start|stop|status|restart|build}"
+        echo "Usage: $0 {start|stop|status|restart}"
         exit 1
         ;;
 esac
